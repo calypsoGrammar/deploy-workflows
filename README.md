@@ -22,7 +22,8 @@ workflows here from the template.
   live commit and the target, unless `force_migrations` is ticked.
 - **What readers count.** Every real run records a GitHub deployment with task `release` (payload: `previous`,
   `rollback`) and finishes it as `success` or `failure`. GitHub also records a deployment with task `deploy` for
-  every job that names an environment, dry runs included; readers ignore those.
+  every job that names an environment, dry runs included; readers ignore those. That per-job record finishes a few seconds after ours and marks ours `inactive`,
+  so a release's outcome is its newest status other than `inactive`.
 
 ## The stable tag
 

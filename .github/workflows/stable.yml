@@ -89,7 +89,9 @@ jobs:
               latest="$(gh api "$repo/deployments?environment=production&task=release&per_page=1" -q '.[0] | select(.) | "\(.id) \(.sha)"')"
               if [ -z "$latest" ]; then echo "No production release recorded yet."; exit 0; fi
               read -r id sha <<< "$latest"
-              read -r state at <<< "$(gh api "$repo/deployments/$id/statuses?per_page=1" -q '.[0] | "\(.state) \(.created_at)"')"
+              # GitHub's own per-job deployment finishes after ours and marks ours inactive, so the outcome is the
+              # newest status that isn't `inactive`.
+              read -r state at <<< "$(gh api "$repo/deployments/$id/statuses?per_page=20" -q '[.[] | select(.state != "inactive")][0] | "\(.state) \(.created_at)"')"
               if [ "$state" != success ]; then echo "Production's latest release (${sha::7}) is '$state', not success; not promoting."; exit 0; fi
               age_hours=$(( ( $(date -u +%s) - $(date -u -d "$at" +%s) ) / 3600 ))
               if [ "$age_hours" -lt "$MIN_HOURS" ]; then echo "${sha::7} has been live ${age_hours}h of the ${MIN_HOURS}h needed."; exit 0; fi
