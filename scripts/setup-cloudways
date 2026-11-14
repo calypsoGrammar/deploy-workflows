@@ -1,0 +1,127 @@
+#!/usr/bin/env bash
+# Sets up an app's Cloudways deploy (CAL-2249): GitHub environments, their variables and secrets, and a pull
+# request adding the caller workflows. Run from a console with `gh` signed in and push rights on the repository.
+#
+#   setup-cloudways <owner/repo> --server <name> --app <folder> --url <https://…> --checks "<check>[,<check>…]"
+#                   [--staging-server <name> --staging-app <folder> --staging-url <https://…>] [--replace]
+#
+# Servers are named in ${XDG_CONFIG_HOME:-~/.config}/deploy-workflows/cloudways-servers, one per line:
+#   <name> <host> <user> [port]
+# (the server's master SSH user; Cloudways → Server → Master Credentials).
+#
+# The one manual step: the script makes a new SSH key for the repository and prints its public half for you to
+# add in Cloudways (Server → Master Credentials → SSH Public Keys). It waits, then checks the app folder over
+# SSH before writing anything to GitHub. The private key goes only into the GitHub secret; nothing is kept here.
+set -euo pipefail
+
+usage() { sed -n '5,7p' "$0" | sed 's/^# \{0,1\}//'; exit 2; }
+fail() { echo "setup-cloudways: $*" >&2; exit 1; }
+
+repo="${1:-}"; [[ "$repo" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]] || usage
+shift
+server="" app="" url="" checks="" staging_server="" staging_app="" staging_url="" replace=false
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --server) server="$2"; shift 2 ;;
+    --app) app="$2"; shift 2 ;;
+    --url) url="$2"; shift 2 ;;
+    --checks) checks="$2"; shift 2 ;;
+    --staging-server) staging_server="$2"; shift 2 ;;
+    --staging-app) staging_app="$2"; shift 2 ;;
+    --staging-url) staging_url="$2"; shift 2 ;;
+    --replace) replace=true; shift ;;
+    *) usage ;;
+  esac
+done
+[ -n "$server" ] && [ -n "$app" ] && [ -n "$url" ] && [ -n "$checks" ] || usage
+if [ -n "$staging_app" ] && [ -z "$staging_url" ]; then fail "--staging-app needs --staging-url"; fi
+[ -n "$staging_server" ] || staging_server="$server"
+for folder in "$app" ${staging_app:+"$staging_app"}; do
+  [[ "$folder" =~ ^[A-Za-z0-9_-]+$ ]] || fail "'$folder' should be the app's folder name only (Cloudways → Access Details)"
+done
+for name in gh ssh ssh-keygen ssh-keyscan git; do command -v "$name" > /dev/null || fail "$name is not installed"; done
+
+servers="${XDG_CONFIG_HOME:-$HOME/.config}/deploy-workflows/cloudways-servers"
+[ -f "$servers" ] || fail "no servers list at $servers (lines of: <name> <host> <user> [port])"
+server_line() { awk -v n="$1" '$1 == n { print $2, $3, ($4 == "" ? 22 : $4); found = 1 } END { exit !found }' "$servers" || fail "server '$1' is not in $servers"; }
+read -r host user port <<< "$(server_line "$server")"
+read -r staging_host staging_user staging_port <<< "$(server_line "$staging_server")"
+
+gh repo view "$repo" > /dev/null || fail "can't see $repo with gh"
+
+work="$(mktemp -d)"
+trap 'rm -rf "$work"' EXIT
+key="$work/cloudways"
+ssh-keygen -q -t ed25519 -N '' -C "deploy:$repo" -f "$key"
+
+echo
+echo "Add this public key in Cloudways (Server → Master Credentials → SSH Public Keys) on $server${staging_app:+ and $staging_server}:"
+echo
+cat "$key.pub"
+echo
+
+known="$work/known_hosts"
+check_folder() { # host user port folder
+  ssh -i "$key" -p "$3" -o BatchMode=yes -o IdentitiesOnly=yes -o StrictHostKeyChecking=yes -o UserKnownHostsFile="$known" \
+    "$2@$1" test -d "/home/master/applications/$4/public_html"
+}
+ssh-keyscan -p "$port" "$host" 2> /dev/null >> "$known"
+[ "$staging_host" = "$host" ] || ssh-keyscan -p "$staging_port" "$staging_host" 2> /dev/null >> "$known"
+[ -s "$known" ] || fail "couldn't read the server's host key"
+
+while true; do
+  read -r -p "Press Enter once the key is added (q to stop): " answer
+  [ "$answer" != q ] || exit 1
+  ok=true
+  check_folder "$host" "$user" "$port" "$app" || { echo "Can't reach /home/master/applications/$app/public_html on $server yet."; ok=false; }
+  if [ -n "$staging_app" ]; then
+    check_folder "$staging_host" "$staging_user" "$staging_port" "$staging_app" || { echo "Can't reach /home/master/applications/$staging_app/public_html on $staging_server yet."; ok=false; }
+  fi
+  [ "$ok" = false ] || break
+done
+echo "The app folder$([ -n "$staging_app" ] && echo s) exist. Writing the GitHub settings."
+
+configure_environment() { # environment host user port folder url
+  gh api -X PUT "repos/$repo/environments/$1" > /dev/null
+  gh variable set CLOUDWAYS_HOST --env "$1" -R "$repo" --body "$2"
+  gh variable set CLOUDWAYS_USER --env "$1" -R "$repo" --body "$3"
+  gh variable set CLOUDWAYS_PORT --env "$1" -R "$repo" --body "$4"
+  gh variable set CLOUDWAYS_APP --env "$1" -R "$repo" --body "$5"
+  gh variable set APP_URL --env "$1" -R "$repo" --body "$6"
+  gh secret set CLOUDWAYS_SSH_KEY --env "$1" -R "$repo" < "$key"
+  gh secret set CLOUDWAYS_KNOWN_HOSTS --env "$1" -R "$repo" < "$known"
+}
+configure_environment production "$host" "$user" "$port" "$app" "$url"
+[ -z "$staging_app" ] || configure_environment staging "$staging_host" "$staging_user" "$staging_port" "$staging_app" "$staging_url"
+
+# The caller workflows, on a branch, as a pull request.
+templates="$(cd "$(dirname "$0")/../templates" && pwd)"
+gh repo clone "$repo" "$work/repo" -- --quiet
+cd "$work/repo"
+if [ -f .github/workflows/deploy.yml ] && [ "$replace" != true ]; then
+  echo "$repo already has .github/workflows/deploy.yml; settings are written, workflows left alone (--replace to change them)."
+  exit 0
+fi
+branch="claude/shared-deploy"
+git switch -q -c "$branch"
+mkdir -p .github/workflows
+cp "$templates/stable.yml" .github/workflows/stable.yml
+[ -f .github/deploy-exclude.txt ] || cp "$templates/deploy-exclude.txt" .github/deploy-exclude.txt
+checks_block="$(echo "$checks" | tr ',' '\n' | sed 's/^ *//; s/ *$//; s/^/        /')"
+awk -v checks="$checks_block" '
+  /^      required_checks: \|$/ { print; print checks; skip = 1; next }
+  skip && /^        / { next }
+  { skip = 0; print }
+' "$templates/deploy.yml" > .github/workflows/deploy.yml
+if [ -z "$staging_app" ]; then
+  # No staging: drop the automatic staging deploy.
+  awk '/^  workflow_run:$/ { skip = 1; next } skip && /^    / { next } { skip = 0; print }' .github/workflows/deploy.yml > "$work/deploy.yml"
+  sed -e 's/options: \[production, staging\]/options: [production]/' "$work/deploy.yml" > .github/workflows/deploy.yml
+fi
+git add .github
+git commit -q -m "Deploy through the shared Cloudways workflow
+
+Production by hand, rollback by ref or to the stable tag, staging from green CI on main where configured.
+Environments and secrets were set up with deploy-workflows' setup-cloudways."
+git push -q -u origin "$branch"
+gh pr create -R "$repo" --head "$branch" --title "Deploy through the shared Cloudways workflow" --body "Adds \`.github/workflows/deploy.yml\` and \`stable.yml\`, calling calypsoGrammar/deploy-workflows. The production${staging_app:+ and staging} environment variables and secrets are already set. After merging, run a dry run: Actions → deploy → Run workflow."

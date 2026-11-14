@@ -1,0 +1,23 @@
+# Paths the deploy never uploads, and never deletes from the server.
+# Read by the shared Cloudways deploy (rsync --exclude-from); copy to .github/deploy-exclude.txt.
+# A leading / means "relative to the project root".
+
+# Version control, CI and dev-only files
+/.git
+/.github
+/node_modules
+/tests
+/docs
+/WORKFLOW.md
+# Add this app's own dev-only folders here.
+
+# Server-only: environment config and runtime data
+/.env
+/.env.*
+/storage
+/public/storage
+/database/*.sqlite*
+
+# SSL certificate (Let's Encrypt) challenge files
+/.well-known
+/public/.well-known

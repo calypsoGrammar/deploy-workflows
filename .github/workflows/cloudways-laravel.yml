@@ -1,0 +1,597 @@
+name: cloudways-laravel
+
+# The shared deploy for Laravel apps on Cloudways (CAL-2247): builds on GitHub's runners and syncs to the
+# server over SSH. Grown from picks_2's deploy (itself from Flashcards', Style Council's, Folkfell's and jp's).
+#
+# Each app calls it from its own .github/workflows/deploy.yml (templates/deploy.yml in this repository).
+# The contract every app's deploy meets, and what Archon and Chronology read, is in README.md:
+# - target `production` (always), `staging` (optional); a push to main may reach staging, never production;
+# - `ref`: any commit on main whose required checks passed. An earlier commit is a rollback;
+#   `rollback: true` with no ref deploys the `stable` tag and then holds production (tag `deploy-hold`);
+# - every real run records a GitHub deployment with task `release`, which is what readers count.
+#   (GitHub also records one with task `deploy` for every job that names an environment, dry runs included;
+#   readers ignore those.)
+
+on:
+  workflow_call:
+    inputs:
+      target:
+        description: 'production or staging: a GitHub environment of that name holds the variables and secrets'
+        type: string
+        required: true
+      environment:
+        description: 'The GitHub environment that holds the variables and secrets, when it is not named after the target'
+        type: string
+        default: ''
+      ref:
+        description: 'Commit, tag or branch to deploy; empty = the commit that triggered the caller (or `stable` with rollback)'
+        type: string
+        default: ''
+      dry_run:
+        description: 'List what would change on the server and change nothing'
+        type: boolean
+        default: true
+      rollback:
+        description: 'A deliberate rollback: allowed while production is held, deploys `stable` when ref is empty, and holds production afterwards'
+        type: boolean
+        default: false
+      force_migrations:
+        description: 'Roll back even though migrations differ between the live commit and the target (code only: migrations are not undone)'
+        type: boolean
+        default: false
+      required_checks:
+        description: 'Check runs that must have passed on the commit, one name per line'
+        type: string
+        required: true
+      php_version:
+        type: string
+        default: '8.4'
+      min_server_php:
+        description: 'Lowest PHP the server command line may run'
+        type: string
+        default: '8.4.1'
+      php_extensions:
+        type: string
+        default: ''
+      build_frontend:
+        description: 'Run npm ci and npm run build'
+        type: boolean
+        default: true
+      release_tasks:
+        description: 'Shell run on the server after the sync, in the app folder, with $php set to the PHP command'
+        type: string
+        default: |
+          [ -e public/storage ] || "$php" artisan storage:link
+          "$php" artisan migrate --force
+          "$php" artisan optimize:clear
+          # Artisan ran as the SSH user; let the web server's group write what it created.
+          find storage bootstrap/cache -user "$(id -un)" ! -perm -g+w -exec chmod g+w {} +
+      smoke_paths:
+        description: 'Paths that must answer 2xx or 3xx after the deploy, separated by spaces'
+        type: string
+        default: '/'
+      migrations_path:
+        type: string
+        default: 'database/migrations'
+
+permissions:
+  contents: read
+
+jobs:
+  # Which commit is being released, and whether it may go to this target.
+  release:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+      checks: read
+    outputs:
+      sha: ${{ steps.pick.outputs.sha }}
+    steps:
+      - name: Pick the commit
+        id: pick
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REF: ${{ inputs.ref != '' && inputs.ref || (inputs.rollback && 'stable' || github.sha) }}
+          TARGET: ${{ inputs.target }}
+          ROLLBACK: ${{ inputs.rollback }}
+          EVENT: ${{ github.event_name }}
+          REQUIRED_CHECKS: ${{ inputs.required_checks }}
+        run: |
+          case "$TARGET" in production|staging) ;; *) echo "::error title=Unknown target::'$TARGET' is not production or staging."; exit 1 ;; esac
+          if [ "$TARGET" = production ] && [ "$EVENT" != workflow_dispatch ]; then
+            echo "::error title=Production is manual::Only a run started by hand deploys to production (this run came from '$EVENT')."
+            exit 1
+          fi
+
+          sha="$(gh api "repos/$GITHUB_REPOSITORY/commits/$REF" -q .sha 2> /dev/null || true)"
+          [ -n "$sha" ] || { echo "::error title=Unknown commit::'$REF' is not a commit, tag or branch in this repository."; exit 1; }
+          echo "sha=$sha" >> "$GITHUB_OUTPUT"
+          echo "Releasing ${sha::7} ($REF) to $TARGET"
+
+          # A rollback holds production until the owner clears the hold, so the next merge can't re-ship the fault.
+          hold="$(gh api "repos/$GITHUB_REPOSITORY/git/ref/tags/deploy-hold" -q .object.sha 2> /dev/null || true)"
+          if [ "$TARGET" = production ] && [ -n "$hold" ] && [ "$ROLLBACK" != true ]; then
+            echo "::error title=Production is held::Production was rolled back to ${hold::7} and is held. Once main is fixed, clear the hold (Actions → stable → Run workflow → clear-hold), then deploy."
+            exit 1
+          fi
+
+          # Only commits on main...
+          status="$(gh api "repos/$GITHUB_REPOSITORY/compare/$sha...main" -q .status)"
+          if [ "$status" != ahead ] && [ "$status" != identical ]; then
+            echo "::error title=Not on main::${sha::7} is not part of main. Merge it first; the deploy only takes commits from main."
+            exit 1
+          fi
+          # ...whose required checks all passed.
+          checked=()
+          while IFS= read -r check; do
+            check="$(echo "$check" | xargs)"
+            [ -n "$check" ] || continue
+            state="$(gh api "repos/$GITHUB_REPOSITORY/commits/$sha/check-runs?per_page=100" -q "[.check_runs[] | select(.name == \"$check\")] | sort_by(.completed_at) | last | (.status + \" \" + (.conclusion // \"\"))" || true)"
+            if [ "$state" != "completed success" ]; then
+              echo "::error title=Checks not green::'$check' on ${sha::7} is '${state:-missing}'. Deploy only a commit whose checks all passed."
+              exit 1
+            fi
+            checked+=("$check")
+          done <<< "$REQUIRED_CHECKS"
+          [ ${#checked[@]} -gt 0 ] || { echo "::error title=No required checks::The caller named no required checks."; exit 1; }
+          echo "Checks green on ${sha::7}: $(IFS=,; echo "${checked[*]}")"
+
+  deploy:
+    needs: release
+    permissions:
+      contents: write     # the deploy-hold tag after a rollback
+      deployments: write  # the `release` deployment record
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    concurrency:
+      group: deploy-${{ github.repository }}-${{ inputs.target }}
+      cancel-in-progress: false
+    environment:
+      name: ${{ inputs.environment != '' && inputs.environment || inputs.target }}
+      url: ${{ vars.APP_URL }}
+
+    env:
+      DRY_RUN: ${{ inputs.dry_run }}
+      TARGET: ${{ inputs.target }}
+      ROLLBACK: ${{ inputs.rollback }}
+      RELEASE_SHA: ${{ needs.release.outputs.sha }}
+      PHP_VERSION: ${{ inputs.php_version }}
+      MIN_SERVER_PHP: ${{ inputs.min_server_php }}
+      GH_TOKEN: ${{ github.token }}
+      RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+      CLOUDWAYS_HOST: ${{ vars.CLOUDWAYS_HOST }}
+      CLOUDWAYS_USER: ${{ vars.CLOUDWAYS_USER }}
+      CLOUDWAYS_PORT: ${{ vars.CLOUDWAYS_PORT }}
+      CLOUDWAYS_PATH: ${{ vars.CLOUDWAYS_PATH }}
+      # Or just the app's folder name (Cloudways → Access Details): the path is then /home/master/applications/<it>/public_html
+      CLOUDWAYS_APP: ${{ vars.CLOUDWAYS_APP }}
+      # Optional: PHP command for artisan on the server, e.g. php8.4. Detected when empty.
+      CLOUDWAYS_PHP: ${{ vars.CLOUDWAYS_PHP }}
+      APP_URL: ${{ vars.APP_URL }}
+
+    steps:
+      - name: Check deploy settings
+        env:
+          SSH_KEY: ${{ secrets.CLOUDWAYS_SSH_KEY }}
+          KNOWN_HOSTS: ${{ secrets.CLOUDWAYS_KNOWN_HOSTS }}
+          APP_BASIC_AUTH: ${{ secrets.APP_BASIC_AUTH }}
+        run: |
+          missing=()
+          # (the app's folder name alone is enough: Cloudways puts every app under /home/master/applications)
+          if [ -z "$CLOUDWAYS_PATH" ] && [ -n "$CLOUDWAYS_APP" ]; then
+            [[ "$CLOUDWAYS_APP" =~ ^[A-Za-z0-9_-]+$ ]] || { echo "::error title=Invalid CLOUDWAYS_APP::'$CLOUDWAYS_APP' should be the app's folder name only, e.g. abcdefghij"; exit 1; }
+            CLOUDWAYS_PATH="/home/master/applications/$CLOUDWAYS_APP/public_html"
+          fi
+          [ -n "$CLOUDWAYS_PATH" ] || missing+=("variable CLOUDWAYS_APP (the app's folder name) or CLOUDWAYS_PATH")
+          for name in CLOUDWAYS_HOST CLOUDWAYS_USER; do
+            [ -n "${!name}" ] || missing+=("variable $name")
+          done
+          [ -n "$SSH_KEY" ] || missing+=("secret CLOUDWAYS_SSH_KEY")
+          [ -n "$KNOWN_HOSTS" ] || missing+=("secret CLOUDWAYS_KNOWN_HOSTS")
+          if [ ${#missing[@]} -gt 0 ]; then
+            echo "::error title=Deploy not configured::Add these to the '${{ inputs.environment != '' && inputs.environment || inputs.target }}' environment (Settings → Environments): $(IFS=,; echo "${missing[*]}"). See the deploy-workflows README."
+            exit 1
+          fi
+
+          # Guard against syncing (with --delete) into the wrong folder.
+          path="${CLOUDWAYS_PATH%/}"
+          if [[ ! "$path" =~ ^/[A-Za-z0-9._/-]+/public_html$ || "$path" == *..* ]]; then
+            echo "::error title=Invalid CLOUDWAYS_PATH::'$CLOUDWAYS_PATH' must be the absolute path to the app's public_html folder, e.g. /home/master/applications/abcdefghij/public_html"
+            exit 1
+          fi
+          echo "APP_PATH=$path" >> "$GITHUB_ENV"
+
+          if [[ -n "$CLOUDWAYS_PHP" && ! "$CLOUDWAYS_PHP" =~ ^[A-Za-z0-9._/-]+$ ]]; then
+            echo "::error title=Invalid CLOUDWAYS_PHP::'$CLOUDWAYS_PHP' should be a PHP command or path, e.g. php8.4 or /usr/bin/php8.4"
+            exit 1
+          fi
+
+          if [[ -n "$APP_BASIC_AUTH" && "$APP_BASIC_AUTH" != *:* ]]; then
+            echo "::error title=Invalid APP_BASIC_AUTH::The APP_BASIC_AUTH secret should be username:password."
+            exit 1
+          fi
+
+          if [ "$DRY_RUN" = true ]; then
+            echo "::notice title=Dry run::Nothing on the server will be changed."
+          fi
+
+      - name: Checkout code
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ needs.release.outputs.sha }}
+          # (the whole history, so the migration guard can compare the live commit with this one)
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Setup PHP
+        uses: shivammathur/setup-php@eb7c497e18156a6bbabfef1d3a82760b9eda3962 # v2
+        with:
+          php-version: ${{ env.PHP_VERSION }}
+          tools: composer:v2
+          extensions: ${{ inputs.php_extensions }}
+          coverage: none
+
+      - name: Setup Node
+        if: inputs.build_frontend
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: '22'
+
+      - name: Install production dependencies
+        run: composer install --no-dev --prefer-dist --no-interaction --no-progress --optimize-autoloader
+
+      - name: Build frontend assets
+        if: inputs.build_frontend
+        run: |
+          npm ci
+          npm run build
+
+      - name: Configure SSH
+        env:
+          SSH_KEY: ${{ secrets.CLOUDWAYS_SSH_KEY }}
+          KNOWN_HOSTS: ${{ secrets.CLOUDWAYS_KNOWN_HOSTS }}
+        run: |
+          install -m 700 -d ~/.ssh
+          printf '%s\n' "$SSH_KEY" > ~/.ssh/cloudways
+          chmod 600 ~/.ssh/cloudways
+          printf '%s\n' "$KNOWN_HOSTS" > ~/.ssh/known_hosts
+          cat > ~/.ssh/config <<EOF
+          Host cloudways
+            HostName $CLOUDWAYS_HOST
+            User $CLOUDWAYS_USER
+            Port ${CLOUDWAYS_PORT:-22}
+            IdentityFile ~/.ssh/cloudways
+            IdentitiesOnly yes
+            StrictHostKeyChecking yes
+            BatchMode yes
+            ServerAliveInterval 30
+          EOF
+
+      - name: Check the server
+        run: |
+          ssh cloudways bash -s -- "$APP_PATH" "$MIN_SERVER_PHP" "$DRY_RUN" "$PHP_VERSION" "$CLOUDWAYS_PHP" <<'REMOTE' | tee "$RUNNER_TEMP/server-check.txt"
+          set -euo pipefail
+          # ssh drops empty arguments, so the optional last one may be missing.
+          app="$1" min_php="$2" dry_run="$3" series="$4" preferred="${5:-}"
+          fail() { echo "::error title=$1::$2"; exit 1; }
+          warn() { echo "::warning title=$1::$2"; }
+          # Missing setup that a dry run can report but a real deploy can't continue past.
+          need() { if [ "$dry_run" = true ]; then warn "$1" "$2"; else fail "$1" "$2"; fi; }
+          version_of() { "$1" -r 'echo PHP_VERSION;' 2> /dev/null || echo unknown; }
+          new_enough() { "$1" -r "exit(version_compare(PHP_VERSION, '$min_php', '>=') ? 0 : 1);" 2> /dev/null; }
+
+          [ -d "$app" ] || fail "App folder not found" "$app does not exist on the server. Check CLOUDWAYS_PATH."
+          cd "$app"
+
+          # The web PHP version is set per app in Cloudways, but the plain `php` command
+          # over SSH is the server's default CLI version, which can be older. Use a
+          # version-named binary (php8.4) for artisan when the default is too old.
+          if [ -n "$preferred" ]; then
+            command -v "$preferred" > /dev/null || fail "CLOUDWAYS_PHP not found" "'$preferred' doesn't exist on the server."
+            new_enough "$preferred" || fail "CLOUDWAYS_PHP too old" "'$preferred' is PHP $(version_of "$preferred"); this app needs $min_php or newer."
+            php_bin="$preferred"
+          else
+            php_bin=""
+            for candidate in php "php$series" "/usr/bin/php$series" "/usr/local/bin/php$series"; do
+              if command -v "$candidate" > /dev/null && new_enough "$candidate"; then
+                php_bin="$candidate"
+                break
+              fi
+            done
+            if [ -z "$php_bin" ]; then
+              found="$(compgen -c php | grep -E '^php[0-9.]*$' | sort -u | while read -r p; do printf '%s (%s), ' "$p" "$(version_of "$p")"; done)"
+              found="${found%, }"
+              fail "No PHP $min_php+ on the command line" "The SSH php command is PHP $(version_of php) and no php$series binary was found. PHP commands on the server: ${found:-none}. Set the CLOUDWAYS_PHP variable to one that is $min_php or newer."
+            fi
+          fi
+          command -v rsync > /dev/null || fail "rsync missing" "rsync is not installed on the server."
+
+          echo "Using '$php_bin' (PHP $(version_of "$php_bin")) for artisan. The default 'php' command is PHP $(version_of php)."
+          echo "DEPLOY_PHP_BIN=$php_bin"
+          echo "Current contents of $app:"
+          ls -A | sed 's/^/  /'
+
+          if [ -d .git ]; then
+            warn "Cloudways Git checkout found" "$app has a .git folder from Cloudways 'Deployment via Git'. Don't use Pull in the Cloudways panel for this app any more; GitHub Actions deploys it now."
+          fi
+
+          if [ ! -f .env ]; then
+            need "No .env on the server" "Create $app/.env before the first real deploy (see the deploy-workflows README)."
+          elif ! grep -Eq '^APP_KEY=base64:.{20,}' .env; then
+            need "APP_KEY not set" "Set APP_KEY in $app/.env (generate one with: php artisan key:generate --show)."
+          elif ! grep -Eq '^APP_ENV=production' .env || ! grep -Eq '^APP_DEBUG=false' .env; then
+            warn "Not production settings" "$app/.env should have APP_ENV=production and APP_DEBUG=false."
+          fi
+
+          if ! command -v "$php_bin" > /dev/null || ! [ -f "$app/RELEASE" ]; then
+            echo "DEPLOY_LIVE=none"
+          else
+            echo "DEPLOY_LIVE=$(sed -n 's/^sha=//p' "$app/RELEASE")"
+          fi
+          if [ -f artisan ] && [ -f vendor/autoload.php ] && [ -f .env ]; then
+            echo "Pending migrations on the server before this release (the new code may add more):"
+            "$php_bin" artisan migrate:status --pending --no-ansi 2> /dev/null | sed 's/^/  /' || echo "  (could not list them)"
+          fi
+          REMOTE
+          echo "PHP_BIN=$(sed -n 's/^DEPLOY_PHP_BIN=//p' "$RUNNER_TEMP/server-check.txt")" >> "$GITHUB_ENV"
+          live="$(sed -n 's/^DEPLOY_LIVE=//p' "$RUNNER_TEMP/server-check.txt")"
+          echo "PREVIOUS_SHA=$live" >> "$GITHUB_ENV"
+          {
+            echo "## $TARGET: ${RELEASE_SHA::7}"
+            echo
+            echo "| | Commit |"
+            echo "| --- | --- |"
+            echo "| Live before this run | \`${live::40}\` |"
+            echo "| This release | \`$RELEASE_SHA\` |"
+            echo
+            echo "To roll back, run this workflow again with **ref** set to the commit that was live before."
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Check migrations before going back
+        env:
+          FORCE: ${{ inputs.force_migrations }}
+          MIGRATIONS: ${{ inputs.migrations_path }}
+        run: |
+          # Going to an older commit rolls back code, never the database. Refuse when the migrations differ,
+          # unless forced: the old code may not run against the newer schema.
+          live="${PREVIOUS_SHA:-none}"
+          if [ "$live" = none ] || [ "$live" = "$RELEASE_SHA" ]; then
+            echo "No live commit to compare with (or it is this one)."
+            exit 0
+          fi
+          if ! git cat-file -e "$live^{commit}" 2> /dev/null; then
+            echo "::warning title=Live commit unknown::The server reports ${live::7}, which is not in this repository's history; migrations were not compared."
+            exit 0
+          fi
+          if ! git merge-base --is-ancestor "$RELEASE_SHA" "$live"; then
+            echo "${RELEASE_SHA::7} is not older than the live ${live::7}: not a rollback."
+            exit 0
+          fi
+          changed="$(git diff --name-only "$RELEASE_SHA" "$live" -- "$MIGRATIONS")"
+          if [ -z "$changed" ]; then
+            echo "Rolling back from ${live::7} to ${RELEASE_SHA::7}: no migrations differ."
+            exit 0
+          fi
+          list="$(echo "$changed" | tr '\n' ' ')"
+          if [ "$FORCE" = true ]; then
+            echo "::warning title=Rolling back across migrations::These migrations are newer than ${RELEASE_SHA::7} and stay applied: $list"
+          elif [ "$DRY_RUN" = true ]; then
+            echo "::warning title=Rollback would be refused::These migrations are newer than ${RELEASE_SHA::7}: $list. A real run needs force_migrations."
+          else
+            echo "::error title=Migrations differ::These migrations are newer than ${RELEASE_SHA::7} and would stay applied: $list. Roll forward with a fix, or run again with force_migrations if the old code works with the newer schema."
+            exit 1
+          fi
+
+      - name: Record the deployment
+        id: record
+        if: env.DRY_RUN != 'true'
+        run: |
+          # The record readers count (task `release`); GitHub's own per-job record (task `deploy`) also covers dry runs.
+          id="$(jq -n --arg ref "$RELEASE_SHA" --arg env "$TARGET" --arg previous "${PREVIOUS_SHA:-none}" --argjson rollback "$ROLLBACK" \
+            '{ref: $ref, environment: $env, task: "release", auto_merge: false, required_contexts: [], production_environment: ($env == "production"), payload: {previous: $previous, rollback: $rollback}, description: (if $rollback then "rollback" else "release" end)}' \
+            | gh api "repos/$GITHUB_REPOSITORY/deployments" --input - -q .id)"
+          echo "DEPLOYMENT_ID=$id" >> "$GITHUB_ENV"
+          gh api "repos/$GITHUB_REPOSITORY/deployments/$id/statuses" -f state=in_progress -f log_url="$RUN_URL" > /dev/null
+
+      - name: Check app files aren't public
+        if: env.APP_URL != ''
+        env:
+          APP_BASIC_AUTH: ${{ secrets.APP_BASIC_AUTH }}
+        run: |
+          url="${APP_URL%/}"
+          site_host="$(echo "$url" | sed -E 's#^[a-z]+://##; s#[:/].*$##')"
+          # Staging sites are usually behind a password (HTTP basic auth).
+          auth=()
+          [ -z "$APP_BASIC_AUTH" ] || auth=(--user "$APP_BASIC_AUTH")
+
+          # A site that can't be reached can't be checked, so that's an error, not a pass.
+          code="$(curl -s -o /dev/null -w '%{http_code}' "${auth[@]}" --max-time 15 --retry 2 --retry-all-errors "$url/" || true)"
+          if [ "$code" = 000 ]; then
+            echo "::error title=Can't reach APP_URL::No response from $url. Use the app's own address (Cloudways → Access Details → Application URL), or point the domain's DNS at $CLOUDWAYS_HOST."
+            exit 1
+          elif [ "$code" = 401 ] && [ ${#auth[@]} -gt 0 ]; then
+            echo "::error title=APP_BASIC_AUTH rejected::$url asks for a password and the APP_BASIC_AUTH secret wasn't accepted. Check the username and password."
+            exit 1
+          elif [ "$code" = 401 ]; then
+            echo "::notice title=Password-protected site::$url asks for a password, so the files below are checked as a visitor without one. Add the APP_BASIC_AUTH secret to check them logged in too."
+          fi
+
+          # Different IPs are normal behind a CDN such as Cloudflare, so only warn.
+          site_ips="$(getent ahostsv4 "$site_host" | awk '{print $1}' | sort -u | xargs)"
+          server_ips="$(getent ahostsv4 "$CLOUDWAYS_HOST" | awk '{print $1}' | sort -u | xargs)"
+          if [ -n "$server_ips" ] && ! grep -qwFf <(tr ' ' '\n' <<< "$server_ips") <<< "$site_ips"; then
+            echo "::warning title=APP_URL may not be this server::$site_host resolves to ${site_ips:-nothing}, but the deploy goes to $CLOUDWAYS_HOST ($server_ips). Unless a CDN sits in front, APP_URL is probably the wrong site."
+          fi
+
+          for file in .env composer.json artisan; do
+            code="$(curl -s -o /dev/null -w '%{http_code}' "${auth[@]}" --max-time 15 "$url/$file" || true)"
+            if [ "$code" = 200 ]; then
+              echo "::error title=App files are publicly readable::$url/$file returns 200. In Cloudways set Application Settings → General → Webroot to public_html/public before deploying."
+              exit 1
+            elif [ "$code" = 000 ]; then
+              echo "::error title=Couldn't check app files::No response for $url/$file, so it's unknown whether it's public."
+              exit 1
+            fi
+          done
+          echo "OK: $url responds ($site_host → $site_ips), and .env, composer.json and artisan are not served"
+
+      - name: Plan file changes (dry run)
+        if: env.DRY_RUN == 'true'
+        run: |
+          rsync -rltz --omit-dir-times --ignore-existing --dry-run --itemize-changes \
+            storage/ "cloudways:$APP_PATH/storage/" > "$RUNNER_TEMP/storage-plan.txt"
+          rsync -rltz --omit-dir-times --delete --dry-run --itemize-changes \
+            --exclude-from=.github/deploy-exclude.txt \
+            ./ "cloudways:$APP_PATH/" > "$RUNNER_TEMP/plan.txt"
+
+          added="$(grep -c '^<f+++++++' "$RUNNER_TEMP/plan.txt" || true)"
+          updated="$(grep -E '^<f' "$RUNNER_TEMP/plan.txt" | grep -vc '^<f+++++++' || true)"
+          deleted="$(grep -c '^\*deleting' "$RUNNER_TEMP/plan.txt" || true)"
+          {
+            echo "## Dry run: changes a real deploy would make"
+            echo
+            echo "Target: \`$CLOUDWAYS_USER@$CLOUDWAYS_HOST:$APP_PATH\`"
+            echo
+            echo "| New files | Changed files | Deleted from server |"
+            echo "| --- | --- | --- |"
+            echo "| $added | $updated | $deleted |"
+            echo
+            echo "### Would be deleted from the server"
+            echo
+            if [ "$deleted" -gt 0 ]; then
+              echo '```'
+              grep '^\*deleting' "$RUNNER_TEMP/plan.txt" | sed 's/^\*deleting *//' | head -300
+              echo '```'
+            else
+              echo "Nothing."
+            fi
+            echo
+            echo "Cache files in \`bootstrap/cache/\` appear here on every deploy. They are rebuilt straight after the sync."
+            echo
+            echo "Never touched: \`.env\`, \`storage/\` contents, \`public/storage\`, \`.git\`, \`.well-known\` (full list in \`.github/deploy-exclude.txt\`)."
+            echo "Missing \`storage/\` folders that would be created: $(grep -c '^cd' "$RUNNER_TEMP/storage-plan.txt" || true)"
+          } >> "$GITHUB_STEP_SUMMARY"
+          echo "New: $added, changed: $updated, deleted: $deleted (details in the run summary)"
+
+      - name: Enable maintenance mode
+        if: env.DRY_RUN != 'true'
+        run: |
+          ssh cloudways bash -s -- "$APP_PATH" "$PHP_BIN" <<'REMOTE'
+          cd "$1"
+          if [ -f artisan ] && [ -f vendor/autoload.php ]; then
+            "$2" artisan down --retry=15 || echo "::warning::Could not enable maintenance mode; continuing."
+          else
+            echo "No Laravel install yet; skipping maintenance mode."
+          fi
+          REMOTE
+
+      - name: Sync files
+        id: sync
+        if: env.DRY_RUN != 'true'
+        run: |
+          # Create any missing storage folders without touching existing files.
+          rsync -rltz --omit-dir-times --ignore-existing \
+            storage/ "cloudways:$APP_PATH/storage/"
+          rsync -rltz --omit-dir-times --delete --stats \
+            --exclude-from=.github/deploy-exclude.txt \
+            ./ "cloudways:$APP_PATH/"
+
+      - name: Run release tasks
+        id: release_tasks
+        if: env.DRY_RUN != 'true'
+        env:
+          RELEASE_TASKS: ${{ inputs.release_tasks }}
+        run: |
+          # The caller's tasks, run in the app folder with $php set to the server's PHP command.
+          { printf 'set -euo pipefail\ncd %q\nphp=%q\n' "$APP_PATH" "$PHP_BIN"; printf '%s\n' "$RELEASE_TASKS"; } | ssh cloudways bash -s
+
+      - name: Disable maintenance mode
+        # Only after the release tasks succeeded: a failed migration leaves the database half-way, and the new code
+        # shouldn't serve it. The site stays in maintenance until a fixed release, or a rollback, finishes.
+        # (A failure before the sync changed no files, so the old release comes back up.)
+        if: always() && env.DRY_RUN != 'true' && env.PHP_BIN != '' && (steps.release_tasks.outcome == 'success' || steps.sync.outcome != 'success')
+        run: |
+          ssh cloudways bash -s -- "$APP_PATH" "$PHP_BIN" <<'REMOTE'
+          cd "$1"
+          if [ -f artisan ] && [ -f vendor/autoload.php ]; then
+            "$2" artisan up
+          fi
+          REMOTE
+
+      - name: Record the release on the server
+        if: env.DRY_RUN != 'true'
+        env:
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          # (ssh joins its arguments into one remote command line, so quote each for the remote shell)
+          ssh cloudways bash -s -- "$(printf '%q ' "$APP_PATH" "$RELEASE_SHA" "${PREVIOUS_SHA:-none}" "$RUN_URL")" <<'REMOTE'
+          set -euo pipefail
+          cd "$1"
+          [ ! -f RELEASE ] || cp RELEASE RELEASE.previous
+          printf 'sha=%s\nprevious=%s\ndeployed_at=%s\nrun=%s\n' "$2" "$3" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$4" > RELEASE
+          REMOTE
+
+      - name: Check the live site
+        if: env.DRY_RUN != 'true' && env.APP_URL != ''
+        env:
+          APP_BASIC_AUTH: ${{ secrets.APP_BASIC_AUTH }}
+          SMOKE_PATHS: ${{ inputs.smoke_paths }}
+        run: |
+          url="${APP_URL%/}"
+          auth=()
+          [ -z "$APP_BASIC_AUTH" ] || auth=(--user "$APP_BASIC_AUTH")
+
+          # Pages that must load, and one of the built assets (from the manifest of this build).
+          # shellcheck disable=SC2016 # (PHP's own variables, not the shell's)
+          asset=""
+          [ ! -f public/build/manifest.json ] || asset="$(php -r '$m = json_decode(file_get_contents("public/build/manifest.json"), true); foreach ($m as $e) { if (str_ends_with($e["file"], ".css")) { echo "/build/".$e["file"]; break; } }')"
+          # shellcheck disable=SC2086 # (the caller's paths, separated by spaces)
+          for path in $SMOKE_PATHS ${asset:-}; do
+            code="$(curl -s -o /dev/null -w '%{http_code}' "${auth[@]}" --retry 5 --retry-delay 3 --retry-connrefused --max-time 15 "$url$path" || true)"
+            echo "GET $url$path → $code"
+            if [ "$code" = 401 ] && [ ${#auth[@]} -eq 0 ]; then
+              echo "::warning title=Site is password-protected::$url asks for a password, so the deploy couldn't check the page itself. The files were deployed. Check it in a browser, or add the APP_BASIC_AUTH secret (username:password) so the deploy can log in."
+              break
+            elif [ "$code" = 401 ]; then
+              echo "::error title=APP_BASIC_AUTH rejected::$url didn't accept the APP_BASIC_AUTH secret. The files were deployed; check the username and password."
+              exit 1
+            elif [[ ! "$code" =~ ^[23] ]]; then
+              echo "::error title=Site not responding after deploy::$url$path returned $code. The files were deployed; check the site, and that APP_URL is this app's address."
+              exit 1
+            fi
+          done
+
+          for file in .env composer.json artisan; do
+            code="$(curl -s -o /dev/null -w '%{http_code}' "${auth[@]}" --max-time 15 "$url/$file" || true)"
+            if [ "$code" = 200 ]; then
+              echo "::error title=App files are publicly readable::$url/$file returns 200. Set the Cloudways webroot to public_html/public now."
+              exit 1
+            elif [ "$code" = 000 ]; then
+              echo "::error title=Couldn't check app files::No response for $url/$file, so it's unknown whether it's public."
+              exit 1
+            fi
+          done
+          echo "### Deployed \`${RELEASE_SHA::7}\` to $url (pages and built assets OK)" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: What to do if this failed
+        if: failure() && env.DRY_RUN != 'true'
+        run: |
+          echo "::error title=Deploy failed::If it failed after the file sync, the site is left in maintenance mode on purpose. The release may be partly applied. Check the site; to go back, run this workflow with ref=${PREVIOUS_SHA:-<the previous commit>} (code only: migrations are not undone, see the deploy-workflows README)."
+
+      - name: Hold production after a rollback
+        if: success() && env.DRY_RUN != 'true' && env.ROLLBACK == 'true' && env.TARGET == 'production'
+        run: |
+          # Every later production deploy refuses until the owner clears the hold (the stable workflow's clear-hold).
+          if gh api "repos/$GITHUB_REPOSITORY/git/ref/tags/deploy-hold" > /dev/null 2>&1; then
+            gh api -X PATCH "repos/$GITHUB_REPOSITORY/git/refs/tags/deploy-hold" -f sha="$RELEASE_SHA" -F force=true > /dev/null
+          else
+            gh api "repos/$GITHUB_REPOSITORY/git/refs" -f ref=refs/tags/deploy-hold -f sha="$RELEASE_SHA" > /dev/null
+          fi
+          echo "::notice title=Production held::Rolled back to ${RELEASE_SHA::7}. Production deploys refuse until the hold is cleared."
+
+      - name: Finish the deployment record
+        if: always() && env.DEPLOYMENT_ID != ''
+        env:
+          OUTCOME: ${{ job.status == 'success' && 'success' || 'failure' }}
+        run: gh api "repos/$GITHUB_REPOSITORY/deployments/$DEPLOYMENT_ID/statuses" -f state="$OUTCOME" -f log_url="$RUN_URL" -f environment_url="$APP_URL" > /dev/null

@@ -1,0 +1,104 @@
+name: stable
+
+# The `stable` tag and the production hold (CAL-2248), shared by every app. Each app calls it from its own
+# .github/workflows/stable.yml (templates/stable.yml): on a schedule to promote, and by hand to pin or clear the hold.
+#
+# - promote: when production's latest `release` deployment succeeded at least `min_hours` ago, nothing newer
+#   has been released to production since, and production isn't held, move `stable` to that commit and add
+#   a dated `stable-YYYY-MM-DD` tag.
+# - pin: tag `ref` (a commit on main) as stable now.
+# - clear-hold: delete the `deploy-hold` tag a rollback left, so production deploys work again.
+#
+# Tags, not branches: a tag names one commit and readers (the deploy, Chronology) need nothing else.
+
+on:
+  workflow_call:
+    inputs:
+      action:
+        description: 'promote, pin or clear-hold'
+        type: string
+        default: promote
+      ref:
+        description: 'pin: the commit, tag or branch to tag as stable'
+        type: string
+        default: ''
+      min_hours:
+        description: 'promote: how long production must have run a release before it is stable'
+        type: number
+        default: 48
+
+permissions:
+  contents: read
+
+jobs:
+  stable:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: write      # move tags
+      deployments: read
+    env:
+      GH_TOKEN: ${{ github.token }}
+      ACTION: ${{ inputs.action }}
+      REF: ${{ inputs.ref }}
+      MIN_HOURS: ${{ inputs.min_hours }}
+    steps:
+      - name: Stable tag
+        run: |
+          set -euo pipefail
+          repo="repos/$GITHUB_REPOSITORY"
+
+          tag_commit() { gh api "$repo/git/ref/tags/$1" -q .object.sha 2> /dev/null || true; }
+          set_tag() {
+            if [ -n "$(tag_commit "$1")" ]; then
+              gh api -X PATCH "$repo/git/refs/tags/$1" -f sha="$2" -F force=true > /dev/null
+            else
+              gh api "$repo/git/refs" -f ref="refs/tags/$1" -f sha="$2" > /dev/null
+            fi
+          }
+          mark_stable() {
+            set_tag stable "$1"
+            set_tag "stable-$(date -u +%Y-%m-%d)" "$1"
+            echo "::notice title=Stable::stable is now ${1::7}."
+            echo "### stable → \`${1::7}\`" >> "$GITHUB_STEP_SUMMARY"
+          }
+
+          case "$ACTION" in
+            clear-hold)
+              held="$(tag_commit deploy-hold)"
+              if [ -z "$held" ]; then echo "Production is not held."; exit 0; fi
+              gh api -X DELETE "$repo/git/refs/tags/deploy-hold"
+              echo "::notice title=Hold cleared::Production was held at ${held::7}; deploys to production work again."
+              ;;
+
+            pin)
+              [ -n "$REF" ] || { echo "::error title=No ref::Name the commit, tag or branch to pin."; exit 1; }
+              sha="$(gh api "$repo/commits/$REF" -q .sha 2> /dev/null || true)"
+              [ -n "$sha" ] || { echo "::error title=Unknown commit::'$REF' is not in this repository."; exit 1; }
+              status="$(gh api "$repo/compare/$sha...main" -q .status)"
+              if [ "$status" != ahead ] && [ "$status" != identical ]; then
+                echo "::error title=Not on main::${sha::7} is not part of main."
+                exit 1
+              fi
+              mark_stable "$sha"
+              ;;
+
+            promote)
+              if [ -n "$(tag_commit deploy-hold)" ]; then echo "Production is held after a rollback; not promoting."; exit 0; fi
+              # Production's newest release record, and its latest status.
+              latest="$(gh api "$repo/deployments?environment=production&task=release&per_page=1" -q '.[0] | select(.) | "\(.id) \(.sha)"')"
+              if [ -z "$latest" ]; then echo "No production release recorded yet."; exit 0; fi
+              read -r id sha <<< "$latest"
+              read -r state at <<< "$(gh api "$repo/deployments/$id/statuses?per_page=1" -q '.[0] | "\(.state) \(.created_at)"')"
+              if [ "$state" != success ]; then echo "Production's latest release (${sha::7}) is '$state', not success; not promoting."; exit 0; fi
+              age_hours=$(( ( $(date -u +%s) - $(date -u -d "$at" +%s) ) / 3600 ))
+              if [ "$age_hours" -lt "$MIN_HOURS" ]; then echo "${sha::7} has been live ${age_hours}h of the ${MIN_HOURS}h needed."; exit 0; fi
+              if [ "$(tag_commit stable)" = "$sha" ]; then echo "stable is already ${sha::7}."; exit 0; fi
+              mark_stable "$sha"
+              ;;
+
+            *)
+              echo "::error title=Unknown action::'$ACTION' is not promote, pin or clear-hold."
+              exit 1
+              ;;
+          esac
