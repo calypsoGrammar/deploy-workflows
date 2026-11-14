@@ -1,0 +1,62 @@
+name: deploy
+
+# This app's deploy: the shared Cloudways workflow in calypsoGrammar/deploy-workflows (README there).
+# Production: Actions → deploy → Run workflow (a dry run unless unticked). An earlier `ref` rolls back;
+# tick `rollback` with no ref to go back to the `stable` tag, which also holds production until cleared.
+# Staging (delete the workflow_run trigger if the app has no staging): every green CI run on main deploys there.
+
+on:
+  workflow_run:
+    workflows: [CI]
+    types: [completed]
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      target:
+        description: 'Where to deploy'
+        type: choice
+        options: [production, staging]
+        default: production
+      dry_run:
+        description: 'Dry run: list what would change on the server, change nothing'
+        type: boolean
+        default: true
+      ref:
+        description: 'Commit, tag or branch to deploy (empty = main; with rollback, empty = stable)'
+        type: string
+        default: ''
+      rollback:
+        description: 'Rollback: allowed while production is held, and holds production afterwards'
+        type: boolean
+        default: false
+      force_migrations:
+        description: 'Roll back even though migrations differ (they are not undone)'
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+  checks: read
+  deployments: write
+
+jobs:
+  deploy:
+    if: github.event_name == 'workflow_dispatch' || github.event.workflow_run.conclusion == 'success'
+    uses: calypsoGrammar/deploy-workflows/.github/workflows/cloudways-laravel.yml@v1
+    with:
+      target: ${{ github.event_name == 'workflow_run' && 'staging' || inputs.target }}
+      ref: ${{ github.event_name == 'workflow_run' && github.event.workflow_run.head_sha || inputs.ref }}
+      dry_run: ${{ github.event_name == 'workflow_dispatch' && inputs.dry_run }}
+      rollback: ${{ github.event_name == 'workflow_dispatch' && inputs.rollback }}
+      force_migrations: ${{ github.event_name == 'workflow_dispatch' && inputs.force_migrations }}
+      # The check runs that must have passed on the commit (the job names in CI).
+      required_checks: |
+        PHP tests
+      # Optional, with their defaults:
+      # php_version: '8.4'
+      # min_server_php: '8.4.1'
+      # php_extensions: ''          (e.g. 'gd, intl, zip')
+      # build_frontend: true
+      # smoke_paths: '/'
+      # release_tasks: |   (default: storage:link if missing, migrate --force, optimize:clear, group-writable storage)
+    secrets: inherit
