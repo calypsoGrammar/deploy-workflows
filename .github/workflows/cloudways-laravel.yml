@@ -104,13 +104,13 @@ jobs:
             exit 1
           fi
 
-          sha="$(gh api "repos/$GITHUB_REPOSITORY/commits/$REF" -q .sha 2> /dev/null || true)"
+          sha="$(gh api "repos/$GITHUB_REPOSITORY/commits/$REF" -q .sha 2> /dev/null)" || sha=""
           [ -n "$sha" ] || { echo "::error title=Unknown commit::'$REF' is not a commit, tag or branch in this repository."; exit 1; }
           echo "sha=$sha" >> "$GITHUB_OUTPUT"
           echo "Releasing ${sha::7} ($REF) to $TARGET"
 
           # A rollback holds production until the owner clears the hold, so the next merge can't re-ship the fault.
-          hold="$(gh api "repos/$GITHUB_REPOSITORY/git/ref/tags/deploy-hold" -q .object.sha 2> /dev/null || true)"
+          hold="$(gh api "repos/$GITHUB_REPOSITORY/git/ref/tags/deploy-hold" -q .object.sha 2> /dev/null)" || hold=""
           if [ "$TARGET" = production ] && [ -n "$hold" ] && [ "$ROLLBACK" != true ]; then
             echo "::error title=Production is held::Production was rolled back to ${hold::7} and is held. Once main is fixed, clear the hold (Actions → stable → Run workflow → clear-hold), then deploy."
             exit 1
@@ -127,7 +127,7 @@ jobs:
           while IFS= read -r check; do
             check="$(echo "$check" | xargs)"
             [ -n "$check" ] || continue
-            state="$(gh api "repos/$GITHUB_REPOSITORY/commits/$sha/check-runs?per_page=100" -q "[.check_runs[] | select(.name == \"$check\")] | sort_by(.completed_at) | last | (.status + \" \" + (.conclusion // \"\"))" || true)"
+            state="$(gh api "repos/$GITHUB_REPOSITORY/commits/$sha/check-runs?per_page=100" -q "[.check_runs[] | select(.name == \"$check\")] | sort_by(.completed_at) | last | (.status + \" \" + (.conclusion // \"\"))")" || state=""
             if [ "$state" != "completed success" ]; then
               echo "::error title=Checks not green::'$check' on ${sha::7} is '${state:-missing}'. Deploy only a commit whose checks all passed."
               exit 1

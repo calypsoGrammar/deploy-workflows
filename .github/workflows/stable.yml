@@ -48,7 +48,7 @@ jobs:
           set -euo pipefail
           repo="repos/$GITHUB_REPOSITORY"
 
-          tag_commit() { gh api "$repo/git/ref/tags/$1" -q .object.sha 2> /dev/null || true; }
+          tag_commit() { local found; found="$(gh api "$repo/git/ref/tags/$1" -q .object.sha 2> /dev/null)" && echo "$found"; return 0; }
           set_tag() {
             if [ -n "$(tag_commit "$1")" ]; then
               gh api -X PATCH "$repo/git/refs/tags/$1" -f sha="$2" -F force=true > /dev/null
@@ -73,7 +73,7 @@ jobs:
 
             pin)
               [ -n "$REF" ] || { echo "::error title=No ref::Name the commit, tag or branch to pin."; exit 1; }
-              sha="$(gh api "$repo/commits/$REF" -q .sha 2> /dev/null || true)"
+              sha="$(gh api "$repo/commits/$REF" -q .sha 2> /dev/null)" || sha=""
               [ -n "$sha" ] || { echo "::error title=Unknown commit::'$REF' is not in this repository."; exit 1; }
               status="$(gh api "$repo/compare/$sha...main" -q .status)"
               if [ "$status" != ahead ] && [ "$status" != identical ]; then
