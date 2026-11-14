@@ -58,6 +58,9 @@ jobs:
       # min_server_php: '8.4.1'
       # php_extensions: ''          (e.g. 'gd, intl, zip')
       # build_frontend: true
+      # build_variables: ''          (variables the frontend build reads, one name per line, e.g. VITE_PUSHER_APP_KEY)
+      # composer: true
+      # laravel: true               (false for plain PHP; also set release_tasks: '')
       # smoke_paths: '/'
       # release_tasks: |   (default: storage:link if missing, migrate --force, optimize:clear, group-writable storage)
     secrets: inherit
