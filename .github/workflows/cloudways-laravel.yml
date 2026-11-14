@@ -19,6 +19,10 @@ on:
         description: 'production or staging: a GitHub environment of that name holds the variables and secrets'
         type: string
         required: true
+      environment:
+        description: 'The GitHub environment that holds the variables and secrets, when it is not named after the target'
+        type: string
+        default: ''
       ref:
         description: 'Commit, tag or branch to deploy; empty = the commit that triggered the caller (or `stable` with rollback)'
         type: string
@@ -144,7 +148,7 @@ jobs:
       group: deploy-${{ github.repository }}-${{ inputs.target }}
       cancel-in-progress: false
     environment:
-      name: ${{ inputs.target }}
+      name: ${{ inputs.environment != '' && inputs.environment || inputs.target }}
       url: ${{ vars.APP_URL }}
 
     env:
@@ -186,7 +190,7 @@ jobs:
           [ -n "$SSH_KEY" ] || missing+=("secret CLOUDWAYS_SSH_KEY")
           [ -n "$KNOWN_HOSTS" ] || missing+=("secret CLOUDWAYS_KNOWN_HOSTS")
           if [ ${#missing[@]} -gt 0 ]; then
-            echo "::error title=Deploy not configured::Add these to the '$TARGET' environment (Settings → Environments): $(IFS=,; echo "${missing[*]}"). See the deploy-workflows README."
+            echo "::error title=Deploy not configured::Add these to the '${{ inputs.environment != '' && inputs.environment || inputs.target }}' environment (Settings → Environments): $(IFS=,; echo "${missing[*]}"). See the deploy-workflows README."
             exit 1
           fi
 

@@ -1,0 +1,191 @@
+name: github-pages
+
+# The shared deploy for static sites on GitHub Pages, from mazemaker's pages.yml and rollback.yml.
+# Same contract as cloudways-laravel.yml (README.md): production only by hand, only green commits on main,
+# rollback by an earlier `ref` or to the `stable` tag (then production is held), and a `release` deployment
+# record for every real run. Pages has no staging: `production` is the only target.
+#
+# The repository's Pages source must be "GitHub Actions" (Settings → Pages).
+
+on:
+  workflow_call:
+    inputs:
+      target:
+        description: 'production (Pages has no staging)'
+        type: string
+        default: production
+      ref:
+        description: 'Commit, tag or branch to publish; empty = the commit that triggered the caller (or `stable` with rollback)'
+        type: string
+        default: ''
+      dry_run:
+        description: 'Build and check, publish nothing'
+        type: boolean
+        default: true
+      rollback:
+        description: 'A deliberate rollback: allowed while production is held, publishes `stable` when ref is empty, and holds production afterwards'
+        type: boolean
+        default: false
+      required_checks:
+        description: 'Check runs that must have passed on the commit, one name per line'
+        type: string
+        required: true
+      node_version:
+        type: string
+        default: '22'
+      build_command:
+        description: 'Shell run in the checkout to build the site; empty for a site served as it is'
+        type: string
+        default: |
+          npm ci --no-audit --no-fund
+          npm run build
+      site_path:
+        description: 'The folder to publish, relative to the checkout'
+        type: string
+        default: dist
+
+permissions:
+  contents: read
+
+jobs:
+  # Which commit is being published, and whether it may be.
+  release:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+      checks: read
+    outputs:
+      sha: ${{ steps.pick.outputs.sha }}
+    steps:
+      - name: Pick the commit
+        id: pick
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REF: ${{ inputs.ref != '' && inputs.ref || (inputs.rollback && 'stable' || github.sha) }}
+          TARGET: ${{ inputs.target }}
+          ROLLBACK: ${{ inputs.rollback }}
+          EVENT: ${{ github.event_name }}
+          REQUIRED_CHECKS: ${{ inputs.required_checks }}
+        run: |
+          [ "$TARGET" = production ] || { echo "::error title=Unknown target::GitHub Pages has only production, not '$TARGET'."; exit 1; }
+          if [ "$EVENT" != workflow_dispatch ]; then
+            echo "::error title=Production is manual::Only a run started by hand publishes (this run came from '$EVENT')."
+            exit 1
+          fi
+
+          sha="$(gh api "repos/$GITHUB_REPOSITORY/commits/$REF" -q .sha 2> /dev/null || true)"
+          [ -n "$sha" ] || { echo "::error title=Unknown commit::'$REF' is not a commit, tag or branch in this repository."; exit 1; }
+          echo "sha=$sha" >> "$GITHUB_OUTPUT"
+          echo "Publishing ${sha::7} ($REF)"
+
+          hold="$(gh api "repos/$GITHUB_REPOSITORY/git/ref/tags/deploy-hold" -q .object.sha 2> /dev/null || true)"
+          if [ -n "$hold" ] && [ "$ROLLBACK" != true ]; then
+            echo "::error title=Production is held::Production was rolled back to ${hold::7} and is held. Once main is fixed, clear the hold (Actions → stable → Run workflow → clear-hold), then deploy."
+            exit 1
+          fi
+
+          status="$(gh api "repos/$GITHUB_REPOSITORY/compare/$sha...main" -q .status)"
+          if [ "$status" != ahead ] && [ "$status" != identical ]; then
+            echo "::error title=Not on main::${sha::7} is not part of main. Merge it first; the deploy only takes commits from main."
+            exit 1
+          fi
+          checked=()
+          while IFS= read -r check; do
+            check="$(echo "$check" | xargs)"
+            [ -n "$check" ] || continue
+            state="$(gh api "repos/$GITHUB_REPOSITORY/commits/$sha/check-runs?per_page=100" -q "[.check_runs[] | select(.name == \"$check\")] | sort_by(.completed_at) | last | (.status + \" \" + (.conclusion // \"\"))" || true)"
+            if [ "$state" != "completed success" ]; then
+              echo "::error title=Checks not green::'$check' on ${sha::7} is '${state:-missing}'. Deploy only a commit whose checks all passed."
+              exit 1
+            fi
+            checked+=("$check")
+          done <<< "$REQUIRED_CHECKS"
+          [ ${#checked[@]} -gt 0 ] || { echo "::error title=No required checks::The caller named no required checks."; exit 1; }
+          echo "Checks green on ${sha::7}: $(IFS=,; echo "${checked[*]}")"
+
+  build:
+    needs: release
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+    steps:
+      - name: Check out the commit
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.release.outputs.sha }}
+          persist-credentials: false
+      - name: Use Node.js
+        if: hashFiles('package.json') != ''
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ inputs.node_version }}
+      - name: Build
+        if: inputs.build_command != ''
+        env:
+          BUILD_COMMAND: ${{ inputs.build_command }}
+        run: bash -euo pipefail -c "$BUILD_COMMAND"
+      - name: Check the site folder
+        env:
+          SITE_PATH: ${{ inputs.site_path }}
+        run: |
+          [ -f "$SITE_PATH/index.html" ] || { echo "::error title=No site::$SITE_PATH/index.html doesn't exist after the build."; exit 1; }
+          echo "Site: $(find "$SITE_PATH" -type f | wc -l) files in $SITE_PATH"
+      - name: Upload the site
+        if: '!inputs.dry_run'
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: ${{ inputs.site_path }}
+
+  deploy:
+    needs: [release, build]
+    if: '!inputs.dry_run'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write     # the deploy-hold tag after a rollback
+      deployments: write  # the `release` deployment record
+      pages: write
+      id-token: write
+    concurrency:
+      group: pages-${{ github.repository }}
+      cancel-in-progress: false
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    env:
+      GH_TOKEN: ${{ github.token }}
+      RELEASE_SHA: ${{ needs.release.outputs.sha }}
+      ROLLBACK: ${{ inputs.rollback }}
+      RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+    steps:
+      - name: Record the deployment
+        run: |
+          previous="$(gh api "repos/$GITHUB_REPOSITORY/deployments?environment=production&task=release&per_page=1" -q '.[0].sha // "none"')"
+          id="$(jq -n --arg ref "$RELEASE_SHA" --arg previous "$previous" --argjson rollback "$ROLLBACK" \
+            '{ref: $ref, environment: "production", task: "release", auto_merge: false, required_contexts: [], production_environment: true, payload: {previous: $previous, rollback: $rollback}, description: (if $rollback then "rollback" else "release" end)}' \
+            | gh api "repos/$GITHUB_REPOSITORY/deployments" --input - -q .id)"
+          echo "DEPLOYMENT_ID=$id" >> "$GITHUB_ENV"
+          gh api "repos/$GITHUB_REPOSITORY/deployments/$id/statuses" -f state=in_progress -f log_url="$RUN_URL" > /dev/null
+
+      - name: Deploy to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v4
+
+      - name: Hold production after a rollback
+        if: success() && env.ROLLBACK == 'true'
+        run: |
+          if gh api "repos/$GITHUB_REPOSITORY/git/ref/tags/deploy-hold" > /dev/null 2>&1; then
+            gh api -X PATCH "repos/$GITHUB_REPOSITORY/git/refs/tags/deploy-hold" -f sha="$RELEASE_SHA" -F force=true > /dev/null
+          else
+            gh api "repos/$GITHUB_REPOSITORY/git/refs" -f ref=refs/tags/deploy-hold -f sha="$RELEASE_SHA" > /dev/null
+          fi
+          echo "::notice title=Production held::Rolled back to ${RELEASE_SHA::7}. Publishing refuses until the hold is cleared."
+
+      - name: Finish the deployment record
+        if: always() && env.DEPLOYMENT_ID != ''
+        env:
+          OUTCOME: ${{ job.status == 'success' && 'success' || 'failure' }}
+          PAGE_URL: ${{ steps.deployment.outputs.page_url }}
+        run: gh api "repos/$GITHUB_REPOSITORY/deployments/$DEPLOYMENT_ID/statuses" -f state="$OUTCOME" -f log_url="$RUN_URL" -f environment_url="$PAGE_URL" > /dev/null

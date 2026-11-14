@@ -53,6 +53,7 @@ jobs:
       required_checks: |
         PHP tests
       # Optional, with their defaults:
+      # environment: ''              (the GitHub environment, when not named after the target)
       # php_version: '8.4'
       # min_server_php: '8.4.1'
       # php_extensions: ''          (e.g. 'gd, intl, zip')
