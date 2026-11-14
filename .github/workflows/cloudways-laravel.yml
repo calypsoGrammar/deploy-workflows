@@ -53,10 +53,22 @@ on:
       php_extensions:
         type: string
         default: ''
+      laravel:
+        description: 'A Laravel app: the server needs a production .env (false for plain PHP; set release_tasks to empty too)'
+        type: boolean
+        default: true
+      composer:
+        description: 'Run composer install (false for PHP apps without composer.json)'
+        type: boolean
+        default: true
       build_frontend:
         description: 'Run npm ci and npm run build'
         type: boolean
         default: true
+      build_variables:
+        description: 'Repository or environment variables (not secrets) the frontend build reads, one name per line, e.g. VITE_PUSHER_APP_KEY'
+        type: string
+        default: ''
       release_tasks:
         description: 'Shell run on the server after the sync, in the app folder, with $php set to the PHP command'
         type: string
@@ -65,7 +77,8 @@ on:
           "$php" artisan migrate --force
           "$php" artisan optimize:clear
           # Artisan ran as the SSH user; let the web server's group write what it created.
-          find storage bootstrap/cache -user "$(id -un)" ! -perm -g+w -exec chmod g+w {} +
+          # (folders the SSH user can't read, such as a web-server-owned livewire-tmp, are skipped, not fatal)
+          find storage bootstrap/cache -user "$(id -un)" ! -perm -g+w -exec chmod g+w {} + 2> /dev/null || true
       smoke_paths:
         description: 'Paths that must answer 2xx or 3xx after the deploy, separated by spaces'
         type: string
@@ -157,6 +170,7 @@ jobs:
       ROLLBACK: ${{ inputs.rollback }}
       RELEASE_SHA: ${{ needs.release.outputs.sha }}
       PHP_VERSION: ${{ inputs.php_version }}
+      LARAVEL: ${{ inputs.laravel }}
       MIN_SERVER_PHP: ${{ inputs.min_server_php }}
       GH_TOKEN: ${{ github.token }}
       RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
@@ -239,11 +253,23 @@ jobs:
           node-version: '22'
 
       - name: Install production dependencies
+        if: inputs.composer
         run: composer install --no-dev --prefer-dist --no-interaction --no-progress --optimize-autoloader
 
       - name: Build frontend assets
         if: inputs.build_frontend
+        env:
+          ALL_VARIABLES: ${{ toJSON(vars) }}
+          BUILD_VARIABLES: ${{ inputs.build_variables }}
         run: |
+          # The named variables, exported for the build (Vite reads VITE_* at build time).
+          while IFS= read -r name; do
+            name="$(echo "$name" | xargs)"
+            [ -n "$name" ] || continue
+            value="$(jq -r --arg n "$name" '.[$n] // empty' <<< "$ALL_VARIABLES")"
+            [ -n "$value" ] || { echo "::error title=Build variable missing::'$name' is not a repository or environment variable."; exit 1; }
+            export "$name=$value"
+          done <<< "$BUILD_VARIABLES"
           npm ci
           npm run build
 
@@ -270,10 +296,10 @@ jobs:
 
       - name: Check the server
         run: |
-          ssh cloudways bash -s -- "$APP_PATH" "$MIN_SERVER_PHP" "$DRY_RUN" "$PHP_VERSION" "$CLOUDWAYS_PHP" <<'REMOTE' | tee "$RUNNER_TEMP/server-check.txt"
+          ssh cloudways bash -s -- "$APP_PATH" "$MIN_SERVER_PHP" "$DRY_RUN" "$PHP_VERSION" "$LARAVEL" "$CLOUDWAYS_PHP" <<'REMOTE' | tee "$RUNNER_TEMP/server-check.txt"
           set -euo pipefail
           # ssh drops empty arguments, so the optional last one may be missing.
-          app="$1" min_php="$2" dry_run="$3" series="$4" preferred="${5:-}"
+          app="$1" min_php="$2" dry_run="$3" series="$4" laravel="$5" preferred="${6:-}"
           fail() { echo "::error title=$1::$2"; exit 1; }
           warn() { echo "::warning title=$1::$2"; }
           # Missing setup that a dry run can report but a real deploy can't continue past.
@@ -316,7 +342,9 @@ jobs:
             warn "Cloudways Git checkout found" "$app has a .git folder from Cloudways 'Deployment via Git'. Don't use Pull in the Cloudways panel for this app any more; GitHub Actions deploys it now."
           fi
 
-          if [ ! -f .env ]; then
+          if [ "$laravel" != true ]; then
+            echo "Not a Laravel app: .env is not checked."
+          elif [ ! -f .env ]; then
             need "No .env on the server" "Create $app/.env before the first real deploy (see the deploy-workflows README)."
           elif ! grep -Eq '^APP_KEY=base64:.{20,}' .env; then
             need "APP_KEY not set" "Set APP_KEY in $app/.env (generate one with: php artisan key:generate --show)."
