@@ -10,8 +10,8 @@ An app meets it when `.github/workflows/deploy.yml` on main has a `workflow_disp
 `production` (and `staging` when the app has one) and that takes a `ref`. In practice: call one of the shared
 workflows here from the template.
 
-- **Production is manual.** Only a run started by hand reaches production; nothing deploys to production on a
-  merge. Staging may deploy on every green CI run on main.
+- **Deploys are manual.** Only a run started by hand reaches production or staging; nothing deploys on a merge.
+  (Automatic staging deploys were dropped in November 2026 to save Actions minutes.)
 - **Environment names.** A target's variables and secrets live in the GitHub environment of the same name, or
   in the one the caller names with `environment` (for apps whose environment predates the contract).
 - **Only green commits on main.** The commit must be on main and the caller's `required_checks` must have passed.
