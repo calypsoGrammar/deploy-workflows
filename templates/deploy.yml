@@ -3,13 +3,9 @@ name: deploy
 # This app's deploy: the shared Cloudways workflow in calypsoGrammar/deploy-workflows (README there).
 # Production: Actions → deploy → Run workflow (a dry run unless unticked). An earlier `ref` rolls back;
 # tick `rollback` with no ref to go back to the `stable` tag, which also holds production until cleared.
-# Staging (delete the workflow_run trigger if the app has no staging): every green CI run on main deploys there.
+# Staging: by hand only (Run workflow with target staging). Nothing deploys on its own.
 
 on:
-  workflow_run:
-    workflows: [CI]
-    types: [completed]
-    branches: [main]
   workflow_dispatch:
     inputs:
       target:
