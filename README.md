@@ -37,6 +37,7 @@ added. Run it by hand to `pin` a chosen commit, or to `clear-hold`. Tags, not br
 | --- | --- |
 | `.github/workflows/cloudways-laravel.yml` | Laravel apps on Cloudways: build on GitHub's runners, rsync over SSH, release tasks, live checks. Grown from picks_2's deploy. |
 | `.github/workflows/github-pages.yml` | Static sites on GitHub Pages, from mazemaker's: production only (Pages has no staging), built, checked and published by hand. Caller: `templates/deploy-pages.yml`. The Pages source must be "GitHub Actions". |
+| `.github/workflows/cloudflare-pages.yml` | Static sites on Cloudflare Pages (`<name>.calypsogrammar.com`): production only, built here, checked and uploaded with Wrangler by hand. Caller: `templates/deploy-cloudflare-pages.yml`. |
 | `.github/workflows/stable.yml` | The `stable` tag and the production hold. |
 
 Droplet apps (Archon, Chronology, Convergence, droplet-backup) don't deploy from Actions: they install from Archon
@@ -60,6 +61,21 @@ secrets (`CLOUDWAYS_SSH_KEY`, `CLOUDWAYS_KNOWN_HOSTS`), and opens a pull request
 The server needs an `.env` in the app folder before the first real deploy, and the Cloudways webroot set to
 `public_html/public`; the deploy checks both. Optional environment settings: `CLOUDWAYS_PHP` (the PHP command for
 artisan, detected when empty) and the `APP_BASIC_AUTH` secret (`user:password`) for a password-protected staging site.
+
+## Adding a site on Cloudflare Pages
+
+1. Create the Pages project (Workers & Pages → Pages → Connect to Git, or the API) with production branch `main`,
+   attach `<name>.calypsogrammar.com`, and add the CNAME `<name>` → `<project>.pages.dev` at the DNS host.
+2. Turn the project's automatic Git builds off (Settings → Builds & deployments, or the API's
+   `source.config.deployments_enabled: false`), so only this workflow publishes.
+3. In the repository: the secret `CLOUDFLARE_API_TOKEN` (a token with Cloudflare Pages: Edit) and the variable
+   `CLOUDFLARE_ACCOUNT_ID`.
+4. Add `deploy.yml` from `templates/deploy-cloudflare-pages.yml` (set `project_name` and `site_url`) and
+   `stable.yml` from `templates/stable.yml`, and a CI job whose name is in `required_checks`. After merging, run a
+   dry run, then a real one.
+
+The build runs on GitHub's runners as on GitHub Pages; Wrangler uploads the built folder as the project's
+production deployment for that commit.
 
 ## Access
 
