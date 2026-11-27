@@ -37,6 +37,7 @@ added. Run it by hand to `pin` a chosen commit, or to `clear-hold`. Tags, not br
 | --- | --- |
 | `.github/workflows/cloudways-laravel.yml` | Laravel apps on Cloudways: build on GitHub's runners, rsync over SSH, release tasks, live checks. Grown from picks_2's deploy. |
 | `.github/workflows/github-pages.yml` | Static sites on GitHub Pages, from mazemaker's: production only (Pages has no staging), built, checked and published by hand. Caller: `templates/deploy-pages.yml`. The Pages source must be "GitHub Actions". |
+| `.github/workflows/coolify.yml` | Apps on the VPS run by Coolify (coolify.calypsogrammar.com): pins the commit, starts a Coolify deployment through its API and waits for it, then checks the site. Caller: `templates/deploy-coolify.yml`. |
 | `.github/workflows/cloudflare-pages.yml` | Static sites on Cloudflare Pages (`<name>.calypsogrammar.com`): production only, built here, checked and uploaded with Wrangler by hand. Caller: `templates/deploy-cloudflare-pages.yml`. |
 | `.github/workflows/stable.yml` | The `stable` tag and the production hold. |
 
@@ -76,6 +77,20 @@ artisan, detected when empty) and the `APP_BASIC_AUTH` secret (`user:password`) 
 
 The build runs on GitHub's runners as on GitHub Pages; Wrangler uploads the built folder as the project's
 production deployment for that commit.
+
+## Adding an app on the VPS (Coolify)
+
+1. Create the application in Coolify (a Dockerfile in the repository, its domain, storage and any scheduled task) and
+   copy its UUID from the dashboard URL (`…/application/<uuid>`). Leave Coolify's automatic deploys off.
+2. In the repository: the secrets `COOLIFY_TOKEN` (Coolify → Keys & Tokens → API tokens, with deploy and write),
+   `CF_ACCESS_CLIENT_ID` and `CF_ACCESS_CLIENT_SECRET` (a Cloudflare Access service token that the Coolify Access
+   application allows with a Service Auth policy).
+3. Add `deploy.yml` from `templates/deploy-coolify.yml` (set `app_uuid`, `site_url` and `required_checks`) and
+   `stable.yml` from `templates/stable.yml`. After merging, run a dry run: it checks the commit and the migrations and
+   that the tokens reach Coolify, then a real one.
+
+Coolify builds the image itself. The workflow pins the application's `git_commit_sha` to the released commit before
+each deployment, which is what makes `ref` and rollbacks exact. The app's own start-up runs its migrations.
 
 ## Access
 
