@@ -1,0 +1,59 @@
+name: deploy
+
+# This app's deploy: the shared Coolify workflow in calypsoGrammar/deploy-workflows (README there).
+# Actions → deploy → Run workflow (a dry run unless unticked). An earlier `ref` rolls back; tick `rollback`
+# with no ref to go back to the `stable` tag, which also holds production until cleared.
+
+on:
+  workflow_dispatch:
+    inputs:
+      target:
+        description: 'Where to deploy'
+        type: choice
+        options: [production]
+        default: production
+      dry_run:
+        description: 'Dry run: check the commit, migrations and the connection to Coolify; deploy nothing'
+        type: boolean
+        default: true
+      ref:
+        description: 'Commit, tag or branch to deploy (empty = main; with rollback, empty = stable)'
+        type: string
+        default: ''
+      rollback:
+        description: 'Rollback: allowed while production is held, and holds production afterwards'
+        type: boolean
+        default: false
+      force_migrations:
+        description: 'Roll back even though migrations differ (they are not undone)'
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+  checks: read
+  deployments: write
+
+jobs:
+  deploy:
+    uses: calypsoGrammar/deploy-workflows/.github/workflows/coolify.yml@v1
+    with:
+      target: ${{ inputs.target }}
+      ref: ${{ inputs.ref }}
+      dry_run: ${{ inputs.dry_run }}
+      rollback: ${{ inputs.rollback }}
+      force_migrations: ${{ inputs.force_migrations }}
+      # The check runs that must have passed on the commit (the job names in CI).
+      required_checks: |
+        build
+      app_uuid: REPLACE-WITH-COOLIFY-APP-UUID
+      site_url: https://REPLACE.calypsogrammar.com
+      # Optional, with their defaults:
+      # health_path: /up
+      # migrations_path: database/migrations
+      # deploy_timeout_minutes: 20
+      # coolify_url: https://coolify.calypsogrammar.com
+    secrets:
+      COOLIFY_TOKEN: ${{ secrets.COOLIFY_TOKEN }}
+      CF_ACCESS_CLIENT_ID: ${{ secrets.CF_ACCESS_CLIENT_ID }}
+      CF_ACCESS_CLIENT_SECRET: ${{ secrets.CF_ACCESS_CLIENT_SECRET }}
